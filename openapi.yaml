@@ -1,0 +1,1944 @@
+openapi: 3.0.3
+info:
+  title: TeamChat API
+  version: 1.1.0
+  description: |
+    REST/JSON contract of the TeamChat server (document Section 8). Real-time events use one WebSocket per client, described under the `Realtime` tag and in
+    `components/schemas` (`WsServerEvent`, `WsClientEvent`).
+
+    ## Conventions
+    * **Base path:** `/api/v1`. Everything is HTTPS/WSS only (SEC-02). `GET /health` is outside the base path.
+    * **Authentication:** `Authorization: Bearer <access_token>` on every endpoint except those marked public
+      (`security: []`). Access token lifetime 15 min, refresh token 7 days, rotated on every use (SEC-03).
+    * **Identifiers** are integers (auto-incrementing, 64-bit), as in the data model (section 7). Only `client_message_id` is a UUID string, because the client generates it. **Timestamps** are ISO 8601 UTC strings (`2026-11-03T14:05:09Z`), USE-06.
+    * **Optional/nullable fields** may be omitted or `null`; the client treats both the same.
+    * **Authorisation (SEC-05):** content of a private channel, a DM or a file is visible only to its members.
+      For anything the caller may not even know exists, the server answers `404 NOT_FOUND`. For public
+      channels (whose existence is public) a non-member gets `403 NOT_A_MEMBER` on messages/members.
+    * **Pagination:** list endpoints take `limit` (1-100, default 50) and an opaque `cursor`; the response has
+      `items` and `next_cursor` (absent on the last page). Message history is the exception: it uses the
+      message `seq` as cursor (see `listMessages`).
+    * **Idempotent sending (REL-03):** `POST .../messages` carries a client-generated `client_message_id`.
+      Repeating a request with the same id returns the original message with `200` and never creates a duplicate.
+    * **Errors:** every non-2xx response has the flat JSON body `{"error": "<CODE>", "message": "<text>",
+      "details": {"<name>": "<text>"}}` (`ErrorResponse`). `error` is one of the codes in `ErrorCode`, `message`
+      is human readable without technical details (USE-03), and the optional `details` maps a request field to
+      the reason it was rejected (or carries extra data). Rate-limited responses are `429`
+      with a `Retry-After` header (seconds).
+    * **JSON naming:** `snake_case` field names, identical to the field names of the data model (section 7).
+    * **Limits (document section 4.9):** message text 1-4,000 chars; up to 10 attachments per message; file 25 MB;
+      channel name 3-50 chars (unique, case-insensitive); channel description up to 500; display name 2-50;
+      workflow title 1-100, category up to 50, description 1-2,000; password at least 8 chars with a letter and a digit.
+        * **Per-user limits (section 4.9):** file storage 500 MB in total (profile picture included); profile picture 2 MB, images only;
+          5 open WebSocket connections (browser tabs).
+    * **Rate limits (SEC-07):** 5 failed sign-ins per 15 min per account and IP; 30 messages per minute per user.
+        * **Overload (PERF-08):** if the request queue is full the server answers `503` with `Retry-After`; the client keeps the
+          message in the Sending state and retries with the same `client_message_id`.
+
+    ## WebSocket (`GET /ws`)
+    1. Call `POST /auth/ws-ticket` (authenticated) to get a single-use ticket valid for 30 seconds.
+    2. Connect to `wss://<host>/ws?ticket=<ticket>`. An invalid ticket is rejected during the handshake with `401`; a 6th open connection of the same user gets `429` (`TOO_MANY_CONNECTIONS`).
+    3. Every frame in both directions is JSON `{"type": "...", "ts": "<UTC>", "payload": {...}}`.
+    4. The server automatically sends events for all conversations the user is a member of; there is no subscribe
+       message. When membership changes, routing changes immediately.
+    5. The client sends `presence.heartbeat` every 25 s. A connection with no frame for 60 s is closed by the server.
+    6. After a lost connection the client reconnects with exponential backoff (1 s up to 30 s), gets a new ticket and
+       catches up through REST: `GET /conversations/{id}/messages?after_seq=`, `GET /notifications`, and
+       `GET /presence` (REL-05). Events missed while offline are never replayed over the WebSocket.
+  contact:
+    name: TeamChat design team
+servers:
+  - url: https://api.teamchat.internal/api/v1
+    description: Reference deployment (host name as in section 8.1 of the document)
+tags:
+  - name: Auth
+    description: Registration, sign-in, tokens, password recovery
+  - name: Users
+    description: Profiles, search, status, personal data
+  - name: Presence
+    description: Online / Away / Offline
+  - name: Conversations
+    description: Channels, DMs, membership
+  - name: Messages
+    description: Sending and reading messages
+  - name: Files
+    description: Upload, listing, download
+  - name: Workflows
+    description: Tasks attached to channels
+  - name: Notifications
+    description: The "Latest notifications" list
+  - name: Search
+    description: Message search
+  - name: Realtime
+    description: WebSocket handshake
+  - name: System
+    description: Health
+
+security:
+  - bearerAuth: []
+
+paths:
+  # ------------------------------------------------------------------ AUTH
+  /auth/register:
+    post:
+      tags: [Auth]
+      operationId: register
+      summary: Create an account and send a confirmation code
+      description: |
+        Creates the user (inactive until the email is confirmed) and emails a 6-digit code valid for 10 minutes.
+        If the email belongs to an unconfirmed account, a new code is sent and the password is replaced.
+        `display_name` is optional; if omitted the part of the email before `@` is used (editable later in Profile).
+      x-requirements: [FR-01, SEC-01, SEC-04]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RegisterRequest'}
+      responses:
+        '201':
+          description: Account created, code sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [email, code_expires_in_seconds]
+                properties:
+                  email: {type: string, format: email}
+                  code_expires_in_seconds: {type: integer, example: 600}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409':
+          description: A confirmed account with this email already exists (`EMAIL_ALREADY_REGISTERED`)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+
+  /auth/confirm-email:
+    post:
+      tags: [Auth]
+      operationId: confirmEmail
+      summary: Confirm the email with the 6-digit code and sign in
+      x-requirements: [FR-01, SEC-04]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code]
+              properties:
+                email: {type: string, format: email}
+                code: {type: string, pattern: '^[0-9]{6}$', example: '482913'}
+      responses:
+        '200':
+          description: Email confirmed, user is signed in
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuthTokens'}
+        '400':
+          description: '`CODE_INVALID` (wrong code) or `CODE_EXPIRED`. Each wrong attempt increments `failed_attempts`.'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '429':
+          description: '`TOO_MANY_ATTEMPTS` - 5 wrong attempts used; request a new code'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+
+  /auth/resend-code:
+    post:
+      tags: [Auth]
+      operationId: resendCode
+      summary: Send a new one-time code
+      description: At most one code per 60 seconds per user. Always answers 204 for unknown emails (no account enumeration).
+      x-requirements: [FR-01, FR-03, SEC-04]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, purpose]
+              properties:
+                email: {type: string, format: email}
+                purpose: {$ref: '#/components/schemas/OneTimeCodePurpose'}
+      responses:
+        '204': {description: Code sent (or silently ignored for unknown email)}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Sign in with email and password
+      x-requirements: [FR-02, SEC-03, SEC-07, SEC-09]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: {type: string, format: email}
+                password: {type: string}
+      responses:
+        '200':
+          description: Signed in
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuthTokens'}
+        '401':
+          description: '`INVALID_CREDENTIALS` (same message for unknown email and wrong password)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '403':
+          description: '`EMAIL_NOT_CONFIRMED` - the client shows the "Confirm email" screen'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshTokens
+      summary: Exchange a refresh token for a new token pair
+      description: The old refresh token is revoked and linked to the new one (`replaced_by_id`). Using a revoked token returns 401.
+      x-requirements: [SEC-03]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: {type: string}
+      responses:
+        '200':
+          description: New token pair
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuthTokens'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Sign out (revokes the refresh token)
+      x-requirements: [FR-02, SEC-03]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: {type: string}
+      responses:
+        '204': {description: Signed out}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /auth/forgot-password:
+    post:
+      tags: [Auth]
+      operationId: forgotPassword
+      summary: Start password recovery (sends a 6-digit code)
+      description: Always answers 204, whether or not the email is registered.
+      x-requirements: [FR-03, SEC-04]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: {type: string, format: email}
+      responses:
+        '204': {description: Code sent if the account exists}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+
+  /auth/verify-reset-code:
+    post:
+      tags: [Auth]
+      operationId: verifyResetCode
+      summary: Check the recovery code (the "Confirm email" screen of password recovery)
+      description: |
+        Consumes the code and returns a `reset_token`: a signed token valid 10 minutes that can be used once, only for
+        `POST /auth/reset-password` (the exact token format is the implementer's choice).
+      x-requirements: [FR-03, SEC-04]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code]
+              properties:
+                email: {type: string, format: email}
+                code: {type: string, pattern: '^[0-9]{6}$'}
+      responses:
+        '200':
+          description: Code accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [reset_token, expires_in_seconds]
+                properties:
+                  reset_token: {type: string}
+                  expires_in_seconds: {type: integer, example: 600}
+        '400':
+          description: '`CODE_INVALID` or `CODE_EXPIRED`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '429':
+          description: '`TOO_MANY_ATTEMPTS`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+
+  /auth/reset-password:
+    post:
+      tags: [Auth]
+      operationId: resetPassword
+      summary: Set a new password after a verified recovery code and sign in
+      description: Revokes all refresh tokens of the user, publishes PasswordChanged and writes an audit entry.
+      x-requirements: [FR-03, SEC-01, SEC-03, SEC-09]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reset_token, new_password]
+              properties:
+                reset_token: {type: string}
+                new_password: {$ref: '#/components/schemas/Password'}
+      responses:
+        '200':
+          description: Password changed, user is signed in
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuthTokens'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /auth/change-password:
+    post:
+      tags: [Auth]
+      operationId: changePassword
+      summary: Change the password while signed in
+      description: Revokes all refresh tokens, including the current one; the response contains a fresh pair for this device.
+      x-requirements: [FR-05, SEC-01, SEC-03, SEC-09]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: {type: string}
+                new_password: {$ref: '#/components/schemas/Password'}
+      responses:
+        '200':
+          description: Password changed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AuthTokens'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /auth/ws-ticket:
+    post:
+      tags: [Auth, Realtime]
+      operationId: createWsTicket
+      summary: Get a single-use ticket for the WebSocket handshake
+      description: Browsers cannot set an `Authorization` header on a WebSocket, so the handshake uses this ticket (valid 30 seconds, one use).
+      x-requirements: [SEC-03]
+      responses:
+        '200':
+          description: Ticket
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ticket, expires_in_seconds]
+                properties:
+                  ticket: {type: string}
+                  expires_in_seconds: {type: integer, example: 30}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  # ----------------------------------------------------------------- USERS
+  /users:
+    get:
+      tags: [Users]
+      operationId: searchUsers
+      summary: Search users (starting a DM, choosing an assignee, inviting)
+      description: Case-insensitive match on display name. Deleted users are never returned.
+      x-requirements: [FR-14, FR-35]
+      parameters:
+        - name: query
+          in: query
+          schema: {type: string, maxLength: 50}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Users ordered by display name
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UserPage'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /users/me:
+    get:
+      tags: [Users]
+      operationId: getMe
+      summary: My profile
+      x-requirements: [FR-04]
+      responses:
+        '200':
+          description: Own profile (includes email)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Me'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    patch:
+      tags: [Users]
+      operationId: updateMe
+      summary: Edit my profile (the Profile panel)
+      description: Only the fields that are present are changed. Send `null` to clear an optional field. The profile picture is changed with `PUT /users/me/avatar`.
+      x-requirements: [FR-04]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: {type: string, minLength: 2, maxLength: 50}
+                description: {type: string, nullable: true, maxLength: 100}
+                location: {type: string, nullable: true, maxLength: 100}
+                note: {type: string, nullable: true, maxLength: 200}
+      responses:
+        '200':
+          description: Updated profile
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Me'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    delete:
+      tags: [Users]
+      operationId: deleteMe
+      summary: Delete my account
+      description: |
+        Sets `deleted_at`, clears email, display name and password hash, revokes all tokens and closes WebSocket
+        connections. Authored messages stay and are shown as "Deleted user". Publishes UserDeleted.
+      x-requirements: [FR-06, SEC-10]
+      responses:
+        '204': {description: Account deleted}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /users/me/avatar:
+    put:
+      tags: [Users]
+      operationId: setAvatar
+      summary: Upload a profile picture
+      description: Image only (PNG, JPEG, WebP), up to 2 MB. Creates a File whose `conversation_id` is empty, sets `avatar_file_id` and counts toward the 500 MB storage quota.
+      x-requirements: [FR-04, SEC-08]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: {type: string, format: binary}
+      responses:
+        '200':
+          description: Updated profile
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Me'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedFileType'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /users/me/status:
+    put:
+      tags: [Users, Presence]
+      operationId: setMyStatus
+      summary: Set my status manually
+      description: |-
+        `AWAY` sets the status to Away manually; it stays Away until the user sends `ONLINE` - activity does not override it (section 5.5.1). `ONLINE` clears the manual Away; the server then computes ONLINE or AWAY from activity. Held in memory with the presence, not stored in the database.
+      x-requirements: [FR-33]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: {type: string, enum: [ONLINE, AWAY]}
+      responses:
+        '204': {description: Status applied (a presence.changed event is published)}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /users/me/export:
+    get:
+      tags: [Users]
+      operationId: exportMyData
+      summary: Export my personal data (GDPR)
+      description: "A JSON document with the profile, memberships, own messages, own workflows and file metadata (not file contents), sent with `Content-Disposition: attachment`."
+      x-requirements: [FR-06, SEC-10]
+      responses:
+        '200':
+          description: Data export
+          headers:
+            Content-Disposition:
+              schema: {type: string, example: 'attachment; filename="teamchat-export.json"'}
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /users/{user_id}:
+    get:
+      tags: [Users]
+      operationId: getUser
+      summary: Another user's profile
+      x-requirements: [FR-04]
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: Public profile (no email)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UserProfile'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /presence:
+    get:
+      tags: [Presence]
+      operationId: getPresence
+      summary: Current status of several users
+      description: Used after sign in and after a reconnect; afterwards the client follows `presence.changed` events. Unknown or deleted ids are returned as OFFLINE.
+      x-requirements: [FR-32, PERF-04]
+      parameters:
+        - name: user_ids
+          in: query
+          required: true
+          description: Comma-separated user ids (at most 100)
+          schema:
+            type: array
+            items: {type: integer, format: int64}
+            maxItems: 100
+          style: form
+          explode: false
+      responses:
+        '200':
+          description: One entry per requested id
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/PresenceEntry'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  # --------------------------------------------------------- CONVERSATIONS
+  /conversations:
+    get:
+      tags: [Conversations]
+      operationId: listMyConversations
+      summary: My channels and DMs with unread counts
+      description: Only conversations the caller is a member of. `query` matches a channel name or, for DMs, the other user's display name. Ordered by the time of the latest message, newest first.
+      x-requirements: [FR-17]
+      parameters:
+        - name: type
+          in: query
+          schema: {$ref: '#/components/schemas/ConversationType'}
+        - name: query
+          in: query
+          schema: {type: string, maxLength: 50}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Conversation page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ConversationPage'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /conversations/{conversation_id}:
+    get:
+      tags: [Conversations]
+      operationId: getConversation
+      summary: One conversation
+      description: Public channels are visible to everyone; private channels and DMs only to members (otherwise 404).
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      responses:
+        '200':
+          description: Conversation
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Conversation'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+      x-requirements: [FR-10]
+
+  /channels:
+    get:
+      tags: [Conversations]
+      operationId: browseChannels
+      summary: Browse channels (the "Channels" page)
+      description: All public channels plus the private channels the caller belongs to. Check `is_member` on each item to show Join or Open.
+      x-requirements: [FR-10]
+      parameters:
+        - name: query
+          in: query
+          schema: {type: string, maxLength: 50}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Channel page ordered by name
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ConversationPage'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    post:
+      tags: [Conversations]
+      operationId: createChannel
+      summary: Create a channel
+      description: The creator becomes OWNER. `member_ids` are added as MEMBER (they receive a MEMBER_JOINED notification).
+      x-requirements: [FR-09]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: {type: string, minLength: 3, maxLength: 50}
+                description: {type: string, maxLength: 500}
+                is_private: {type: boolean, default: false}
+                member_ids:
+                  type: array
+                  items: {type: integer, format: int64}
+      responses:
+        '201':
+          description: Channel created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Conversation'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409':
+          description: '`CHANNEL_NAME_TAKEN` (names are unique, case-insensitive)'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /channels/{conversation_id}/join:
+    post:
+      tags: [Conversations]
+      operationId: joinChannel
+      summary: Join a public channel
+      description: Idempotent; joining a channel you already belong to returns 204. Private channels return 404 (join by invitation only).
+      x-requirements: [FR-10]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      responses:
+        '204': {description: Joined (MemberJoined published)}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /channels/{conversation_id}/leave:
+    post:
+      tags: [Conversations]
+      operationId: leaveChannel
+      summary: Leave a channel
+      description: The OWNER cannot leave while other members remain (`OWNER_CANNOT_LEAVE`); they must remove the other members or delete their account.
+      x-requirements: [FR-12]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      responses:
+        '204': {description: 'Left (MemberLeft published, membership row deleted)'}
+        '409':
+          description: '`OWNER_CANNOT_LEAVE`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /conversations/{conversation_id}/members:
+    get:
+      tags: [Conversations]
+      operationId: listMembers
+      summary: Members of a conversation
+      description: "Members only (public channels: `403 NOT_A_MEMBER` for non-members). A conversation has at most 1,000 members, so the list is not paginated."
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      responses:
+        '200':
+          description: Members ordered by join time
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Member'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+      x-requirements: [FR-13]
+
+  /channels/{conversation_id}/members:
+    post:
+      tags: [Conversations]
+      operationId: addMember
+      summary: Invite a user to a channel
+      description: Any member may invite into a private channel; for public channels the owner may add users. Idempotent. The invited user receives a MEMBER_JOINED notification.
+      x-requirements: [FR-11, FR-13, FR-39]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id: {type: integer, format: int64}
+      responses:
+        '204': {description: User is a member}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /channels/{conversation_id}/members/{user_id}:
+    delete:
+      tags: [Conversations]
+      operationId: removeMember
+      summary: Remove a member (owner only)
+      x-requirements: [FR-13]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '204': {description: Removed (MemberLeft published)}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: '`OWNER_CANNOT_LEAVE` - the owner cannot remove themselves'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /dms:
+    post:
+      tags: [Conversations]
+      operationId: openDm
+      summary: Open (or create) a DM with another user
+      description: The DM is identified by `dm_key` (the two user ids sorted and joined with ":"), so the same two users always get the same conversation.
+      x-requirements: [FR-14]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id: {type: integer, format: int64}
+      responses:
+        '200':
+          description: The DM already existed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Conversation'}
+        '201':
+          description: The DM was created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Conversation'}
+        '400':
+          description: Cannot open a DM with yourself or with a deleted user
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  # -------------------------------------------------------------- MESSAGES
+  /conversations/{conversation_id}/messages:
+    get:
+      tags: [Messages]
+      operationId: listMessages
+      summary: Message history (cursor = message seq)
+      description: |
+        * No cursor: the newest `limit` messages, **newest first**.
+        * `before_seq=N`: messages with `seq < N`, newest first (scrolling up to older messages).
+        * `after_seq=N`: messages with `seq > N`, **oldest first** (catch-up after a reconnect; repeat with the last
+          returned `seq` while `has_more` is true).
+        Give at most one of `before_seq` / `after_seq`. Deleted messages are included with `deleted_at` set and no body.
+      x-requirements: [FR-16, PERF-03, REL-04, REL-05]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+        - name: before_seq
+          in: query
+          schema: {type: integer, format: int64, minimum: 1}
+        - name: after_seq
+          in: query
+          schema: {type: integer, format: int64, minimum: 0}
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Messages
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, has_more]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Message'}
+                  has_more: {type: boolean}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    post:
+      tags: [Messages]
+      operationId: sendMessage
+      summary: Send a message (text and/or attachments)
+      description: |
+        In one transaction the server checks membership, increments `Conversation.last_seq`, assigns it to `seq` and stores the message;
+        after the commit it publishes MessageSent (real-time delivery, notifications, search index).
+        `body` is required unless `attachment_ids` is non-empty. Each attachment must be a file the sender uploaded (not yet attached anywhere)
+        or can already access; attaching an existing file is how "Share" works.
+        Notifications (FR-39): in a DM the other user gets a `MESSAGE_SENT` notification; in a channel only the members listed in
+        `mentioned_user_ids` get one (text "<name> mentioned you"). The `@name` text itself is plain text in `body`.
+        Repeating a request with the same `client_message_id` returns the original message with 200. On overload the server answers 503 with
+        `Retry-After`; the client retries with the same `client_message_id`.
+      x-requirements: [FR-15, FR-19, FR-23, REL-02, REL-03, REL-04, SEC-07]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SendMessageRequest'}
+      responses:
+        '201':
+          description: Message created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Message'}
+        '200':
+          description: Same `client_message_id` was already used; the original message is returned
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Message'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /conversations/{conversation_id}/read:
+    put:
+      tags: [Messages]
+      operationId: markRead
+      summary: Mark messages as read up to a sequence number
+      description: Sets `Membership.last_read_seq`. A value lower than the stored one is ignored.
+      x-requirements: [FR-17]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [last_read_seq]
+              properties:
+                last_read_seq: {type: integer, format: int64, minimum: 0}
+      responses:
+        '204': {description: Saved}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /messages/{message_id}:
+    patch:
+      tags: [Messages]
+      operationId: editMessage
+      summary: Edit my own message
+      description: Sets `edited_at` and publishes `message.updated`. Attachments cannot be changed.
+      x-requirements: [FR-18]
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: {type: string, minLength: 1, maxLength: 4000}
+      responses:
+        '200':
+          description: Updated message
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Message'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: '`MESSAGE_DELETED` - a deleted message cannot be edited'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    delete:
+      tags: [Messages]
+      operationId: deleteMessage
+      summary: Delete a message (author or administrator)
+      description: Soft delete - sets `deleted_at`; the row stays and clients show "message deleted". Publishes `message.deleted`. Idempotent.
+      x-requirements: [FR-18]
+      parameters:
+        - $ref: '#/components/parameters/MessageId'
+      responses:
+        '204': {description: Deleted}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /search/messages:
+    get:
+      tags: [Search]
+      operationId: searchMessages
+      summary: Search messages
+      description: Full-text match on message body in conversations the caller belongs to (membership is enforced by the server). With `conversation_id` the search is limited to that conversation (the "Search" field on a Channel/DM page). Results are newest first. File names are searched with `GET /files?query=` (FR-40).
+      x-requirements: [FR-40, PERF-05, SEC-05]
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: {type: string, minLength: 2, maxLength: 100}
+        - name: conversation_id
+          in: query
+          schema: {type: integer, format: int64}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Search hits
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SearchPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  # ----------------------------------------------------------------- FILES
+  /files:
+    get:
+      tags: [Files]
+      operationId: listFiles
+      summary: Files page (Received / Shared tabs and search by file name)
+      description: |
+        * `relation=received` - files attached to messages written by **other** users in my conversations.
+        * `relation=shared` - files that **I** uploaded and attached to a message.
+        Ordered by upload time, newest first. Avatars are never listed. `query` matches `original_name`.
+      x-requirements: [FR-25, FR-40]
+      parameters:
+        - name: relation
+          in: query
+          required: false
+          schema: {type: string, enum: [received, shared]}
+          description: '`received` = files attached to messages written by other users; `shared` = files I uploaded and attached; omitted = both (used to search all file names, FR-40)'
+        - name: query
+          in: query
+          schema: {type: string, maxLength: 100}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: File page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FilePage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    post:
+      tags: [Files]
+      operationId: uploadFile
+      summary: Upload a file (before attaching it to a message)
+      description: |
+        Streams the upload in 64 KB chunks to a temporary file under a random name; the server never holds the whole file in memory (PERF-07).
+        The type is checked on the first bytes, not on the extension (SEC-08). The upload is stopped with `413` when it passes 25 MB
+        (`PAYLOAD_TOO_LARGE`) or the user's remaining 500 MB quota (`STORAGE_QUOTA_EXCEEDED`); on any failure the temporary file is deleted
+        and no row is written. The returned `id` is then passed in `attachment_ids` of `POST /conversations/{id}/messages`.
+        Files that are not attached to a message within 24 hours may be deleted by the server.
+      x-requirements: [FR-23, PERF-07, SEC-05, SEC-08]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, conversation_id]
+              properties:
+                conversation_id: {type: integer, format: int64, description: The conversation the file is uploaded for; the caller must be a member}
+                file: {type: string, format: binary}
+      responses:
+        '201':
+          description: File stored
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FileMeta'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '415': {$ref: '#/components/responses/UnsupportedFileType'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /files/{file_id}:
+    get:
+      tags: [Files]
+      operationId: getFile
+      summary: File metadata
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+      responses:
+        '200':
+          description: Metadata
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FileMeta'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+      x-requirements: [FR-25]
+    delete:
+      tags: [Files]
+      operationId: deleteFile
+      summary: Delete a file (uploader only)
+      description: Removes the content from file storage and the File row, removes it from the messages it was attached to, and frees the uploader's quota (section 4.9). Idempotent.
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+      responses:
+        '204': {description: Deleted}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+      x-requirements: [SEC-05]
+
+  /files/{file_id}/download:
+    get:
+      tags: [Files]
+      operationId: downloadFile
+      summary: Download a file (the "Open" and "Download" menu items)
+      description: |
+        Streamed in 64 KB chunks with `Content-Length`, `Content-Type`, `Accept-Ranges: bytes` and `Content-Disposition: attachment` (SEC-08, PERF-07).
+        HTTP `Range` requests are supported, so a broken download can resume (`206`). Allowed for the uploader (while unattached) and for
+        members of any conversation that has a message with this file attached (SEC-05); everyone else gets 404. "Open" in the UI downloads
+        the file and opens it with the browser's own handler.
+      x-requirements: [FR-24, SEC-05, SEC-08, PERF-07]
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+        - name: Range
+          in: header
+          required: false
+          description: Byte range to resume a download
+          schema: {type: string, example: 'bytes=1048576-'}
+      responses:
+        '200':
+          description: File content
+          headers:
+            Content-Disposition:
+              schema: {type: string, example: 'attachment; filename="report.pdf"'}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '206':
+          description: Partial content (the requested byte range)
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '416':
+          description: The requested range is outside the file
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+
+  # ------------------------------------------------------------- WORKFLOWS
+  /conversations/{conversation_id}/workflows:
+    post:
+      tags: [Workflows]
+      operationId: createWorkflow
+      summary: Create a workflow in a channel
+      description: |
+        The caller must be a member of the channel; the conversation must be a CHANNEL (not a DM). Status starts as `OPEN`.
+        If `assignee_id` is given it must be a member of the channel; if omitted, the workflow is unassigned and any
+        channel member can claim it with "On it!". Publishes WorkflowAssigned (a notification is created for the
+        assignee when one is set and is not the creator).
+      x-requirements: [FR-34, FR-35, FR-39]
+      parameters:
+        - $ref: '#/components/parameters/ConversationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateWorkflowRequest'}
+      responses:
+        '201':
+          description: Workflow created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Workflow'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /workflows:
+    get:
+      tags: [Workflows]
+      operationId: listWorkflows
+      summary: Workflows page (Due / Completed and ASAP / Soon / Eventually filters)
+      description: |
+        `view` chooses the set: `assigned_to_me` (default, the "Workflows" page), `created_by_me`, or `channel`
+        (all workflows of `conversation_id`, which is then required and must be one the caller belongs to).
+        `status=due` means OPEN or IN_PROGRESS, `completed` means COMPLETED; omit for both.
+        `query` matches title and description. Ordered by importance (ASAP first), then newest first.
+      x-requirements: [FR-37, FR-40]
+      parameters:
+        - name: view
+          in: query
+          schema: {type: string, enum: [assigned_to_me, created_by_me, channel], default: assigned_to_me}
+        - name: conversation_id
+          in: query
+          schema: {type: integer, format: int64}
+        - name: status
+          in: query
+          schema: {type: string, enum: [due, completed]}
+        - name: importance
+          in: query
+          schema: {$ref: '#/components/schemas/Importance'}
+        - name: query
+          in: query
+          schema: {type: string, maxLength: 100}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Workflow page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WorkflowPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /workflows/{workflow_id}:
+    get:
+      tags: [Workflows]
+      operationId: getWorkflow
+      summary: One workflow (the "Workflow" detail page)
+      description: Visible to members of its channel; others get 404.
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          description: Workflow
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Workflow'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+      x-requirements: [FR-37]
+
+  /workflows/{workflow_id}/assign:
+    post:
+      tags: [Workflows]
+      operationId: assignWorkflow
+      summary: Assign or reassign a workflow
+      description: Allowed for the creator or the channel owner, only while the status is `OPEN`. The new assignee must be a channel member. Publishes WorkflowAssigned.
+      x-requirements: [FR-35]
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assignee_id]
+              properties:
+                assignee_id: {type: integer, format: int64}
+      responses:
+        '200':
+          description: Updated workflow
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Workflow'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/InvalidState'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /workflows/{workflow_id}/start:
+    post:
+      tags: [Workflows]
+      operationId: startWorkflow
+      summary: 'Start ("On it!") - OPEN to IN_PROGRESS'
+      description: |
+        The "Start" button of the Workflow page (called "On it!" in sections 2 and 7 of the document). Allowed for the assignee. If the workflow has
+        no assignee, any channel member may claim it: the caller becomes the assignee in the same atomic update. If someone else is the assignee,
+        the answer is `403 NOT_ASSIGNEE` (this also resolves two people pressing at the same moment: the second one loses).
+        Status other than OPEN gives `409 INVALID_STATE`. Publishes WorkflowStatusChanged; the creator ("Assigner") is notified.
+      x-requirements: [FR-35, FR-36, FR-39]
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          description: Updated workflow
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Workflow'}
+        '403':
+          description: '`NOT_ASSIGNEE` or the caller is not a channel member'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/InvalidState'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /workflows/{workflow_id}/complete:
+    post:
+      tags: [Workflows]
+      operationId: completeWorkflow
+      summary: 'Complete - IN_PROGRESS to COMPLETED'
+      description: Assignee only. Sets `completed_at`. Any other status gives `409 INVALID_STATE` (OPEN cannot jump straight to COMPLETED). Publishes WorkflowStatusChanged; the creator is notified.
+      x-requirements: [FR-36, FR-39]
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          description: Updated workflow
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Workflow'}
+        '403':
+          description: '`NOT_ASSIGNEE`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/InvalidState'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /workflows/{workflow_id}/reject:
+    post:
+      tags: [Workflows]
+      operationId: rejectWorkflow
+      summary: Reject - the assignee gives the workflow back
+      description: |
+        Assignee only, only while the status is `OPEN` (section 5.5.2). The assignee is cleared and the status stays `OPEN`; the workflow
+        leaves the rejecting user's Workflows page and the creator ("Assigner") is notified (WORKFLOW_REJECTED). The creator or channel owner
+        can then assign it again (`POST /workflows/{id}/assign`) or any member can claim it with Start. Publishes WorkflowRejected.
+      parameters:
+        - $ref: '#/components/parameters/WorkflowId'
+      responses:
+        '200':
+          description: Updated workflow (`assignee` is null)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Workflow'}
+        '403':
+          description: '`NOT_ASSIGNEE`'
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/InvalidState'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+      x-requirements: [FR-35, FR-39]
+
+  # --------------------------------------------------------- NOTIFICATIONS
+  /notifications:
+    get:
+      tags: [Notifications]
+      operationId: listNotifications
+      summary: Latest notifications (the main page)
+      description: Newest first. Used on page load and after a reconnect; new ones arrive as `notification.created`.
+      x-requirements: [FR-39, REL-05]
+      parameters:
+        - name: unread_only
+          in: query
+          schema: {type: boolean, default: false}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Notification page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NotificationPage'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /notifications/read-all:
+    post:
+      tags: [Notifications]
+      operationId: markAllNotificationsRead
+      summary: Mark all my notifications as read
+      responses:
+        '204': {description: Done}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+      x-requirements: [FR-39]
+
+  /notifications/{notification_id}/read:
+    post:
+      tags: [Notifications]
+      operationId: markNotificationRead
+      summary: Mark one notification as read (when it is clicked)
+      description: Sets `read_at`. Idempotent. Another user's notification returns 404.
+      parameters:
+        - name: notification_id
+          in: path
+          required: true
+          schema: {type: integer, format: int64}
+      responses:
+        '204': {description: Done}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+      x-requirements: [FR-39]
+
+  # ----------------------------------------------------------------
+  # ---------------------------------------------------------------- SYSTEM
+  /health:
+    get:
+      tags: [System]
+      operationId: health
+      summary: Health check
+      x-requirements: [MAIN-05]
+      security: []
+      servers:
+        - url: https://api.teamchat.internal
+      responses:
+        '200':
+          description: Server is up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {type: string, enum: [UP, DEGRADED]}
+                  components:
+                    type: object
+                    description: 'UP/DOWN of database, fileStorage, email, stunTurn'
+                    additionalProperties: {type: string, enum: [UP, DOWN]}
+        '503':
+          description: Database unavailable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, example: DOWN}
+
+  /ws:
+    get:
+      tags: [Realtime]
+      operationId: webSocket
+      summary: WebSocket upgrade (events)
+      description: |
+        Connect with `wss://<host>/ws?ticket=<ticket>` (see `POST /auth/ws-ticket`). The frames are described by the
+        schemas `WsServerEvent` (server to client) and `WsClientEvent` (client to server) in `components/schemas`.
+        This path is documented here only because OpenAPI has no WebSocket object.
+      x-requirements: [SEC-02, SEC-03, SEC-05, PERF-01, PERF-04, REL-05, USE-05]
+      security: []
+      servers:
+        - url: https://api.teamchat.internal
+      parameters:
+        - name: ticket
+          in: query
+          required: true
+          schema: {type: string}
+      responses:
+        '101': {description: Switching Protocols - the WebSocket is open}
+        '401': {description: 'Invalid, expired or already used ticket'}
+        '429': {description: 'Too many open connections for this user (`TOO_MANY_CONNECTIONS`, maximum 5)'}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token from `/auth/login`, `/auth/confirm-email` or `/auth/refresh`
+
+  parameters:
+    ConversationId:
+      name: conversation_id
+      in: path
+      required: true
+      schema: {type: integer, format: int64}
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      schema: {type: integer, format: int64}
+    MessageId:
+      name: message_id
+      in: path
+      required: true
+      schema: {type: integer, format: int64}
+    FileId:
+      name: file_id
+      in: path
+      required: true
+      schema: {type: integer, format: int64}
+    WorkflowId:
+      name: workflow_id
+      in: path
+      required: true
+      schema: {type: integer, format: int64}
+    Limit:
+      name: limit
+      in: query
+      description: Page size
+      schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque `next_cursor` from the previous page
+      schema: {type: string}
+
+  responses:
+    BadRequest:
+      description: '`VALIDATION_FAILED` - invalid or missing input; `details` names the fields'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+          example:
+            error: VALIDATION_FAILED
+            message: Some fields are invalid.
+            details: {password: 'Use at least 8 characters with a letter and a digit.'}
+    Unauthorized:
+      description: '`UNAUTHENTICATED` - missing, invalid or expired access token (the client refreshes and retries once)'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    Forbidden:
+      description: '`FORBIDDEN` or `NOT_A_MEMBER` - signed in but not allowed'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    NotFound:
+      description: '`NOT_FOUND` - does not exist, or the caller may not know it exists'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    InvalidState:
+      description: '`INVALID_STATE` - the workflow status does not allow this action'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    PayloadTooLarge:
+      description: '`PAYLOAD_TOO_LARGE` - file larger than 25 MB (2 MB for a profile picture), or `STORAGE_QUOTA_EXCEEDED` - the 500 MB per-user storage is used up'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    UnsupportedFileType:
+      description: '`UNSUPPORTED_FILE_TYPE` - content type not on the allow-list'
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    TooManyRequests:
+      description: '`RATE_LIMITED` - wait `Retry-After` seconds'
+      headers:
+        Retry-After:
+          schema: {type: integer}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    ServiceUnavailable:
+      description: '`SERVICE_UNAVAILABLE` - the request queue is full; wait `Retry-After` seconds and retry with the same `client_message_id`'
+      headers:
+        Retry-After:
+          schema: {type: integer}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+
+  schemas:
+    # ---------------------------------------------------------------- enums
+    ConversationType: {type: string, enum: [CHANNEL, DM]}
+    MembershipRole: {type: string, enum: [OWNER, MEMBER]}
+    OneTimeCodePurpose: {type: string, enum: [EMAIL_CONFIRM, PASSWORD_RESET]}
+    MessageType: {type: string, enum: [TEXT, SYSTEM]}
+    WorkflowStatus:
+      type: string
+      enum: [OPEN, IN_PROGRESS, COMPLETED]
+      description: OPEN = "To Do", IN_PROGRESS = "In Progress", COMPLETED = "Done"
+    Importance: {type: string, enum: [ASAP, SOON, EVENTUALLY]}
+    NotificationType:
+      type: string
+      enum: [MESSAGE_SENT, MEMBER_JOINED, WORKFLOW_ASSIGNED, WORKFLOW_STATUS_CHANGED, WORKFLOW_REJECTED]
+      description: 'MESSAGE_SENT: a DM from another user, or a mention in a channel. MEMBER_JOINED: invited to a channel. WORKFLOW_*: workflow assigned, started/completed, or rejected by the assignee.'
+    PresenceStatus: {type: string, enum: [ONLINE, AWAY, OFFLINE]}
+    UserRole: {type: string, enum: [USER, ADMIN]}
+    ErrorCode:
+      type: string
+      enum:
+        - VALIDATION_FAILED
+        - UNAUTHENTICATED
+        - INVALID_CREDENTIALS
+        - EMAIL_NOT_CONFIRMED
+        - FORBIDDEN
+        - NOT_A_MEMBER
+        - NOT_ASSIGNEE
+        - NOT_FOUND
+        - EMAIL_ALREADY_REGISTERED
+        - CHANNEL_NAME_TAKEN
+        - INVALID_STATE
+        - MESSAGE_DELETED
+        - OWNER_CANNOT_LEAVE
+        - CODE_INVALID
+        - CODE_EXPIRED
+        - TOO_MANY_ATTEMPTS
+        - RATE_LIMITED
+        - PAYLOAD_TOO_LARGE
+        - UNSUPPORTED_FILE_TYPE
+        - STORAGE_QUOTA_EXCEEDED
+        - SERVICE_UNAVAILABLE
+        - TOO_MANY_CONNECTIONS
+        - INTERNAL_ERROR
+
+    # --------------------------------------------------------------- common
+    ErrorResponse:
+      type: object
+      required: [error, message]
+      properties:
+        error: {$ref: '#/components/schemas/ErrorCode'}
+        message: {type: string, description: 'Human readable, no technical details'}
+        details:
+          type: object
+          additionalProperties: {type: string}
+          description: 'Field name to reason for validation errors'
+    Password:
+      type: string
+      minLength: 8
+      maxLength: 128
+      pattern: '^(?=.*[A-Za-z])(?=.*[0-9]).{8,128}$'
+      description: At least 8 characters with at least one letter and one digit (SEC-01)
+    AuthTokens:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in_seconds, user]
+      properties:
+        access_token: {type: string}
+        refresh_token: {type: string}
+        token_type: {type: string, enum: [Bearer]}
+        expires_in_seconds: {type: integer, example: 900}
+        user: {$ref: '#/components/schemas/Me'}
+    RegisterRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: {type: string, format: email, maxLength: 254}
+        password: {$ref: '#/components/schemas/Password'}
+        display_name: {type: string, minLength: 2, maxLength: 50}
+
+    # ---------------------------------------------------------------- users
+    UserSummary:
+      type: object
+      description: Compact user reference. A deleted user has `display_name` "Deleted user" and no avatar.
+      required: [id, display_name]
+      properties:
+        id: {type: integer, format: int64}
+        display_name: {type: string}
+        avatar_file_id: {type: integer, format: int64, nullable: true}
+    UserProfile:
+      allOf:
+        - $ref: '#/components/schemas/UserSummary'
+        - type: object
+          properties:
+            description: {type: string, nullable: true, description: 'Title, e.g. "Senior Software Engineer"'}
+            location: {type: string, nullable: true}
+            note: {type: string, nullable: true}
+            last_seen_at: {type: string, format: date-time, nullable: true}
+    Me:
+      allOf:
+        - $ref: '#/components/schemas/UserProfile'
+        - type: object
+          required: [email, role, created_at]
+          properties:
+            email: {type: string, format: email}
+            role: {$ref: '#/components/schemas/UserRole'}
+            created_at: {type: string, format: date-time}
+    UserPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/UserProfile'}
+        next_cursor: {type: string}
+    PresenceEntry:
+      type: object
+      required: [user_id, status]
+      properties:
+        user_id: {type: integer, format: int64}
+        status: {$ref: '#/components/schemas/PresenceStatus'}
+        last_seen_at: {type: string, format: date-time, nullable: true}
+
+    # -------------------------------------------------------- conversations
+    Conversation:
+      type: object
+      required: [id, type, created_at, last_seq, is_member, unread_count]
+      properties:
+        id: {type: integer, format: int64}
+        type: {$ref: '#/components/schemas/ConversationType'}
+        name: {type: string, nullable: true, description: Channels only}
+        description: {type: string, nullable: true}
+        is_private: {type: boolean, description: Channels only}
+        created_by: {type: integer, format: int64, nullable: true}
+        created_at: {type: string, format: date-time}
+        last_seq: {type: integer, format: int64, description: Sequence number of the latest message (0 if none)}
+        member_count: {type: integer}
+        is_member: {type: boolean}
+        my_role: {allOf: [ { $ref: '#/components/schemas/MembershipRole' } ], nullable: true}
+        unread_count: {type: integer, description: '`last_seq - last_read_seq` for the caller (0 if not a member)'}
+        other_user: {allOf: [ { $ref: '#/components/schemas/UserSummary' } ], nullable: true, description: DMs only}
+    ConversationPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Conversation'}
+        next_cursor: {type: string}
+    Member:
+      type: object
+      required: [user, role, joined_at]
+      properties:
+        user: {$ref: '#/components/schemas/UserSummary'}
+        role: {$ref: '#/components/schemas/MembershipRole'}
+        joined_at: {type: string, format: date-time}
+
+    # ------------------------------------------------------------- messages
+    SendMessageRequest:
+      type: object
+      required: [client_message_id]
+      properties:
+        client_message_id: {type: string, format: uuid, description: Generated by the client for each new message; reused on retry}
+        body: {type: string, minLength: 1, maxLength: 4000}
+        attachment_ids:
+          type: array
+          maxItems: 10
+          items: {type: integer, format: int64}
+        mentioned_user_ids:
+          type: array
+          items: {type: integer, format: int64}
+          description: Members mentioned with @name; each gets a MESSAGE_SENT notification
+    Message:
+      type: object
+      required: [id, conversation_id, client_message_id, seq, type, attachments, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        conversation_id: {type: integer, format: int64}
+        sender: {allOf: [ { $ref: '#/components/schemas/UserSummary' } ], nullable: true, description: Empty for SYSTEM messages}
+        client_message_id: {type: string, format: uuid}
+        seq: {type: integer, format: int64}
+        type: {$ref: '#/components/schemas/MessageType'}
+        body: {type: string, nullable: true, description: Empty when the message is deleted or has only attachments}
+        attachments:
+          type: array
+          items: {$ref: '#/components/schemas/FileMeta'}
+        created_at: {type: string, format: date-time}
+        edited_at: {type: string, format: date-time, nullable: true}
+        deleted_at: {type: string, format: date-time, nullable: true}
+    SearchPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [message, conversation_id]
+            properties:
+              message: {$ref: '#/components/schemas/Message'}
+              conversation_id: {type: integer, format: int64}
+              conversation_name: {type: string, nullable: true, description: 'Channel name, or the other user''s name for a DM'}
+        next_cursor: {type: string}
+
+    # ---------------------------------------------------------------- files
+    FileMeta:
+      type: object
+      required: [id, original_name, content_type, size_bytes, uploader_id, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        original_name: {type: string}
+        content_type: {type: string, example: application/pdf}
+        size_bytes: {type: integer, format: int64}
+        uploader_id: {type: integer, format: int64}
+        conversation_id: {type: integer, format: int64, nullable: true}
+        created_at: {type: string, format: date-time}
+    FilePage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/FileMeta'}
+        next_cursor: {type: string}
+
+    # ------------------------------------------------------------ workflows
+    CreateWorkflowRequest:
+      type: object
+      required: [title, description, importance]
+      properties:
+        title: {type: string, minLength: 1, maxLength: 100}
+        category: {type: string, maxLength: 50}
+        description: {type: string, minLength: 1, maxLength: 2000}
+        importance: {$ref: '#/components/schemas/Importance'}
+        assignee_id: {type: integer, format: int64, description: Optional; omit to leave it for someone to claim with "On it!"}
+    Workflow:
+      type: object
+      required: [id, conversation_id, creator, title, description, importance, status, created_at, updated_at]
+      properties:
+        id: {type: integer, format: int64}
+        conversation_id: {type: integer, format: int64}
+        creator: {$ref: '#/components/schemas/UserSummary'}
+        assignee: {allOf: [ { $ref: '#/components/schemas/UserSummary' } ], nullable: true}
+        title: {type: string}
+        category: {type: string, nullable: true}
+        description: {type: string}
+        importance: {$ref: '#/components/schemas/Importance'}
+        status: {$ref: '#/components/schemas/WorkflowStatus'}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time, nullable: true}
+    WorkflowPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Workflow'}
+        next_cursor: {type: string}
+
+    # -------------------------------------------------------- notifications
+    Notification:
+      type: object
+      required: [id, type, text, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        type: {$ref: '#/components/schemas/NotificationType'}
+        text: {type: string, description: 'Ready-to-show summary, example: ''Anna assigned you a workflow: Fix login bug'''}
+        conversation_id: {type: integer, format: int64, nullable: true}
+        message_id: {type: integer, format: int64, nullable: true}
+        workflow_id: {type: integer, format: int64, nullable: true}
+        read_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+    NotificationPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Notification'}
+        next_cursor: {type: string}
+
+    # ------------------------------------------------ WebSocket - envelopes
+    WsServerEvent:
+      description: Any frame the server sends. `type` selects the payload schema.
+      oneOf:
+        - $ref: '#/components/schemas/WsMessageCreated'
+        - $ref: '#/components/schemas/WsMessageUpdated'
+        - $ref: '#/components/schemas/WsMessageDeleted'
+        - $ref: '#/components/schemas/WsMemberChanged'
+        - $ref: '#/components/schemas/WsPresenceChanged'
+        - $ref: '#/components/schemas/WsNotificationCreated'
+        - $ref: '#/components/schemas/WsWorkflowEvent'
+        - $ref: '#/components/schemas/WsTyping'
+        - $ref: '#/components/schemas/WsError'
+    WsClientEvent:
+      description: Any frame the client sends. Unknown or malformed frames get an `error` frame; the connection stays open.
+      oneOf:
+        - $ref: '#/components/schemas/WsHeartbeat'
+        - $ref: '#/components/schemas/WsTyping'
+
+    WsMessageCreated:
+      type: object
+      description: Sent to every online member of the conversation, including the sender's other devices.
+      required: [type, ts, payload]
+      properties:
+        type: {type: string, enum: [message.created]}
+        ts: {type: string, format: date-time}
+        payload:
+          type: object
+          required: [message]
+          properties:
+            message: {$ref: '#/components/schemas/Message'}
+    WsMessageUpdated:
+      type: object
+      required: [type, ts, payload]
+      properties:
+        type: {type: string, enum: [message.updated]}
+        ts: {type: string, format: date-time}
+        payload:
+          type: object
+          required: [message]
+          properties:
+            message: {$ref: '#/components/schemas/Message'}
+    WsMessageDeleted:
+      type: object
+      required: [type, ts, payload]
+      properties:
+        type: {type: string, enum: [message.deleted]}
+        ts: {type: string, format: date-time}
+        payload:
+          type: object
+          required: [conversation_id, message_id, deleted_at]
+          properties:
+            conversation_id: {type: integer, format: int64}
+            message_id: {type: integer, format: int64}
+            deleted_at: {type: string, format: date-time}
+    WsMemberChanged:
+      type: object
+      description: '`member.joined` or `member.left`. If `user.id` is the receiving user and the type is `member.joined`, the client loads the new conversation with `GET /conversations/{id}`.'
+      required: [type, ts, payload]
+      properties:
+        type: {type: string, enum: [member.joined, member.left]}
+        ts: {type: string, format: date-time}
+        payload:
+          type: object
+          required: [conversation_id, user]
+          properties:
+            conversation_id: {type: integer, format: int64}
+            user: {$ref: '#/components/schemas/UserSummary'}
+    WsPresenceChanged:
+      type: object
+      description: Sent to users who share at least one conversation with the changed user. Published on every presence transition (section 5.5.1).
+      required: [type, ts, payload]
+      properties:
+        type: {type: string, enum: [presence.changed]}
+        ts: {type: string, format: date-time}
+        payload:
+          type: object
+          required: [user_id, status]
+          properties:
+            user_id: {type: integer, format: int64}
+            status: {$ref: '#/components/schemas/PresenceStatus'}
+    WsNotificationCreated:
+      type: object
+      description: Sent only to the recipient.
+      required: [type, ts, payload]
+      properties:
+        type: {type: string, enum: [notification.created]}
+        ts: {type: string, format: date-time}
+        payload:
+          type: object
+          required: [notification]
+          properties:
+            notification: {$ref: '#/components/schemas/Notification'}
+    WsWorkflowEvent:
+      type: object
+      description: '`workflow.assigned` (created or (re)assigned; WorkflowAssigned), `workflow.status_changed` (Start or Complete; WorkflowStatusChanged) or `workflow.rejected` (WorkflowRejected). Sent to the members of the channel.'
+      required: [type, ts, payload]
+      properties:
+        type: {type: string, enum: [workflow.assigned, workflow.status_changed, workflow.rejected]}
+        ts: {type: string, format: date-time}
+        payload:
+          type: object
+          required: [workflow]
+          properties:
+            workflow: {$ref: '#/components/schemas/Workflow'}
+    WsTyping:
+      type: object
+      description: 'Could (FR-20). Client to server: `{conversation_id}`. Server to the other online members: `{conversation_id, user_id}`. The indicator disappears after 5 seconds without a new event.'
+      required: [type, ts, payload]
+      properties:
+        type: {type: string, enum: [typing]}
+        ts: {type: string, format: date-time}
+        payload:
+          type: object
+          required: [conversation_id]
+          properties:
+            conversation_id: {type: integer, format: int64}
+            user_id: {type: integer, format: int64, description: Set by the server}
+    WsHeartbeat:
+      type: object
+      description: Sent by the client every 25 seconds. `idle` is true when the user has not touched the keyboard or mouse for 5 minutes (presence goes to AWAY); a heartbeat with `idle=false` returns it to ONLINE. The server also treats every other client frame as proof of life.
+      required: [type, payload]
+      properties:
+        type: {type: string, enum: [presence.heartbeat]}
+        ts: {type: string, format: date-time}
+        payload:
+          type: object
+          required: [idle]
+          properties:
+            idle: {type: boolean}
+    WsError:
+      type: object
+      required: [type, ts, payload]
+      properties:
+        type: {type: string, enum: [error]}
+        ts: {type: string, format: date-time}
+        payload:
+          type: object
+          required: [code, message]
+          properties:
+            code: {type: string, example: VALIDATION_FAILED}
+            message: {type: string}
